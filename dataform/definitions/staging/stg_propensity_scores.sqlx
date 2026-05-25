@@ -1,0 +1,50 @@
+-- ============================================================
+-- stg_propensity_scores.sqlx
+-- Staging: validates and normalises raw Vertex AI batch output
+-- before it reaches the mart layer.
+-- ============================================================
+
+config {
+  type: "view",
+  schema: "staging",
+  name: "stg_propensity_scores",
+  description: "Validated propensity scores from Vertex AI batch prediction.",
+  tags: ["lead_scoring", "staging"]
+}
+
+WITH
+
+raw AS (
+  SELECT
+    CAST(JSON_VALUE(prediction, '$.lead_id')          AS STRING)  AS lead_id,
+    CAST(JSON_VALUE(prediction, '$.score')            AS FLOAT64) AS propensity_score_raw,
+    CAST(JSON_VALUE(prediction, '$.model_version')    AS STRING)  AS model_version,
+    CAST(JSON_VALUE(prediction, '$.score_timestamp')  AS TIMESTAMP) AS scored_at
+  FROM `{{project}}.vertex_output.propensity_predictions`
+  WHERE DATE(scored_at) = CURRENT_DATE()
+),
+
+validated AS (
+  SELECT
+    lead_id,
+    -- Clamp scores to valid [0, 1] range (guard against calibration edge cases)
+    LEAST(1.0, GREATEST(0.0, propensity_score_raw))   AS propensity_score,
+    model_version,
+    DATE(scored_at)                                   AS score_date,
+
+    -- Tier assignment based on T-metric thresholds (updated with each model retrain)
+    -- T50 threshold: 0.18 | T90 threshold: 0.42 (example values)
+    CASE
+      WHEN propensity_score_raw >= 0.42 THEN 'HOT'
+      WHEN propensity_score_raw >= 0.18 THEN 'WARM'
+      ELSE 'COLD'
+    END                                               AS lead_tier
+
+  FROM raw
+  WHERE
+    lead_id IS NOT NULL
+    AND propensity_score_raw IS NOT NULL
+    AND propensity_score_raw BETWEEN -0.01 AND 1.01   -- reject obviously corrupt rows
+)
+
+SELECT * FROM validated

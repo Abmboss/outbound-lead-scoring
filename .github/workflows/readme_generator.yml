@@ -1,0 +1,127 @@
+name: README Generator
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.py"
+      - "**.sql"
+      - "**.sqlx"
+      - "requirements.txt"
+  workflow_dispatch:
+
+jobs:
+  generate-readme:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install anthropic
+
+      - name: Collect project context
+        id: context
+        run: |
+          python - <<'EOF'
+          import os, json
+          from pathlib import Path
+
+          files = {}
+          extensions = [".py", ".sql", ".sqlx", ".txt"]
+          skip_dirs = {".git", ".github", "__pycache__", ".venv", "node_modules"}
+
+          for ext in extensions:
+              for p in sorted(Path(".").rglob(f"*{ext}")):
+                  if any(part in skip_dirs for part in p.parts):
+                      continue
+                  try:
+                      content = p.read_text(encoding="utf-8")
+                      # Truncate large files to keep prompt within limits
+                      if len(content) > 4000:
+                          content = content[:4000] + "\n\n[... truncated for brevity ...]"
+                      files[str(p)] = content
+                  except Exception:
+                      pass
+
+          with open("/tmp/project_context.json", "w") as f:
+              json.dump(files, f)
+
+          print(f"Collected {len(files)} files")
+          EOF
+
+      - name: Generate README with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python - <<'EOF'
+          import json, os
+          import anthropic
+
+          with open("/tmp/project_context.json") as f:
+              files = json.load(f)
+
+          # Format project context as readable listing
+          context_blocks = []
+          for path, content in files.items():
+              context_blocks.append(f"### {path}\n```\n{content}\n```")
+          context = "\n\n".join(context_blocks)
+
+          prompt = f"""You are a senior data scientist documenting a production-grade open-source project.
+
+Analyze the following project files and generate a professional, detailed README.md in Markdown.
+
+The README must include:
+1. **Project title and one-line description**
+2. **Overview** — what problem this solves, who uses it, and what the output is
+3. **Architecture** — explain the data flow from raw inputs to scored output (mention BigQuery, Dataform, XGBoost where relevant)
+4. **T50/T90/T95 metrics** — explain what these thresholds mean and why they matter for outbound lead prioritization
+5. **Project structure** — a file tree with a one-line description of each key file
+6. **Quickstart** — how to install, generate sample data, and run a training job
+7. **Key design decisions** — calibration rationale, deduplication strategy, tier logic
+8. **BigQuery/Dataform integration** — brief explanation of how the SQL layer connects to the model
+9. **Contributing and license sections**
+
+Style: technical but clear. Assume the reader is a data engineer or ML engineer.
+Do NOT add placeholder sections. Every section must have real content based on the code.
+
+PROJECT FILES:
+{context}
+
+OUTPUT: only the README.md content, starting with the `#` heading. No preamble."""
+
+          client = anthropic.Anthropic()
+          message = client.messages.create(
+              model="claude-sonnet-4-20250514",
+              max_tokens=4096,
+              messages=[{"role": "user", "content": prompt}],
+          )
+
+          readme_content = message.content[0].text
+          with open("README.md", "w", encoding="utf-8") as f:
+              f.write(readme_content)
+
+          print(f"README generated ({len(readme_content):,} chars)")
+          EOF
+
+      - name: Commit README if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --staged --quiet; then
+            echo "No changes to README — skipping commit"
+          else
+            git commit -m "docs: auto-update README [skip ci]"
+            git push
+          fi
