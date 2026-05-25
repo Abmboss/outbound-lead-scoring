@@ -1,146 +1,142 @@
 # outbound-lead-scoring
 
-> Production-grade propensity scoring pipeline for outbound lead prioritization — XGBoost · BigQuery · Dataform · Vertex AI.
+> Pipeline de propensão para priorização de leads em operações outbound — XGBoost · BigQuery · Dataform · Vertex AI.
 
 ---
 
-## Overview
+## Visão Geral
 
-Insurance and financial services outbound teams face a fundamental prioritization problem: a contact list of thousands of leads but bandwidth for only a fraction of calls per day. Random or FIFO ordering wastes broker time on low-probability contacts and lets high-intent leads go cold.
+Equipes de outbound em seguros e serviços financeiros enfrentam um problema fundamental de priorização: uma lista de milhares de leads, mas capacidade para contatar apenas uma fração por dia. Ordenação aleatória ou por FILA desperdiça o tempo dos corretores em contatos de baixa probabilidade e deixa leads de alta intenção esfriarem.
 
-This project implements an end-to-end **propensity scoring system** that ranks outbound leads by their estimated conversion probability. The scored output feeds directly into CRM queues, giving brokers a prioritized, tiered call list every morning.
+Este projeto implementa um **sistema de propensão ponta a ponta** que ordena leads outbound pela probabilidade estimada de conversão. O output é consumido diretamente pelas filas do CRM, entregando aos corretores uma lista de chamadas priorizada e segmentada toda manhã.
 
-**Key outputs per lead:**
-- `propensity_score` — calibrated probability of conversion (0–1)
-- `lead_tier` — HOT / WARM / COLD bucket based on T-metric thresholds
-- `top_arguments` — personalized argumentation codes from the argumentation engine
-- `broker_priority_rank` — rank within each broker's assigned portfolio
-- `suggested_call_window` — MORNING / AFTERNOON / ANY based on historical answer patterns
+**Saídas por lead:**
+- `propensity_score` — probabilidade calibrada de conversão (0–1)
+- `lead_tier` — segmento HOT / WARM / COLD com base nos limiares T50/T90/T95
+- `top_arguments` — códigos de argumentação personalizados
+- `broker_priority_rank` — posição do lead dentro do portfólio de cada corretor
+- `suggested_call_window` — janela sugerida de ligação (MANHÃ / TARDE / QUALQUER) baseada em padrões históricos de atendimento
 
 ---
 
-## Architecture
+## Arquitetura
 
 ```
-Raw Sources                Feature Store              Model Layer             CRM Export
-──────────                 ─────────────              ───────────             ──────────
-CRM Events    ──▶  BigQuery SQL    ──▶  feat_behavioral   ──▶  XGBoost +     ──▶  mart_lead_scoring
-Product Data  ──▶  (behavioral_      feat_rfm               Calibration          (Dataform SQLX)
-CRM Attrs         features.sql)      feat_products          (Vertex AI)
-                                     feat_crm              │
+Fontes Brutas              Feature Store              Camada de Modelo        Exportação CRM
+─────────────              ─────────────              ────────────────        ──────────────
+Eventos CRM   ──▶  SQL BigQuery    ──▶  feat_behavioral   ──▶  XGBoost +     ──▶  mart_lead_scoring
+Produtos      ──▶  (behavioral_      feat_rfm               Calibração            (Dataform SQLX)
+Atributos CRM      features.sql)      feat_products         (Vertex AI)
+                                      feat_crm             │
                                                            ▼
-                                                    T50/T90/T95 thresholds
-                                                    → tier assignment
+                                                    Limiares T50/T90/T95
+                                                    → segmentação de tier
 ```
 
-**Data flow:**
-1. Raw CRM events and product data land in BigQuery (partitioned by date)
-2. Daily Dataform pipeline computes feature tables (`feat_*`) via rolling window aggregations
-3. Vertex AI batch prediction job scores all active leads using the trained XGBoost pipeline
-4. `stg_propensity_scores` validates and tiers the raw scores
-5. `mart_lead_scoring` joins scores with argumentation, deduplication, and CRM context
-6. Downstream: Power BI dashboard + CRM API sync pull from the mart
+**Fluxo de dados:**
+1. Eventos CRM e dados de produtos chegam no BigQuery (particionados por data)
+2. Pipeline diário do Dataform computa as tabelas de features (`feat_*`) via agregações em janelas deslizantes
+3. Job de predição em lote no Vertex AI pontua todos os leads ativos com o pipeline XGBoost treinado
+4. `stg_propensity_scores` valida e segmenta os scores brutos
+5. `mart_lead_scoring` junta scores com argumentação, deduplicação e contexto de CRM
+6. Dashboard Power BI e sincronização via API do CRM consomem o mart
 
 ---
 
-## T50 / T90 / T95 Metrics
+## Métricas T50 / T90 / T95
 
-Standard classification thresholds (0.5 cutoff) are inappropriate for imbalanced outbound lists with 3–5% base conversion rates. Instead, this project uses **T-percentile metrics**:
+Limiares de classificação padrão (corte em 0,5) são inadequados para listas outbound com taxa de conversão base de 3–5%. Em vez disso, este projeto utiliza **métricas de percentil T**:
 
-| Metric | Definition | Operational meaning |
-|--------|-----------|-------------------|
-| **T50** | Minimum score threshold that captures 50% of converters | Contact the top X% of leads to reach half of everyone who would convert |
-| **T90** | Minimum score threshold that captures 90% of converters | The "safe" contact budget — captures nearly all converters with the smallest list |
-| **T95** | Minimum score threshold that captures 95% of converters | Near-exhaustive capture — used for high-value product campaigns |
+| Métrica | Definição | Significado operacional |
+|---------|-----------|------------------------|
+| **T50** | Score mínimo que captura 50% dos conversores | Contatar os X% melhores leads para alcançar metade de todos que converteriam |
+| **T90** | Score mínimo que captura 90% dos conversores | Orçamento de contato "seguro" — captura quase todos os conversores com a menor lista |
+| **T95** | Score mínimo que captura 95% dos conversores | Captura exaustiva — usado em campanhas de produtos de alto valor |
 
-**Example interpretation:** If T90 = 0.42 and T90 covers 28% of the lead pool, contacting only the top 28% of leads captures 90% of conversions. This translates directly to **contact efficiency gains** reportable to business stakeholders.
+**Exemplo de interpretação:** Se T90 = 0,42 e cobre 28% da base de leads, contatar apenas os 28% melhores captura 90% das conversões. Isso se traduz diretamente em **ganhos de eficiência de contato** reportáveis para o negócio.
 
-Thresholds are recomputed after each model retrain and stored in `stg_propensity_scores.sqlx` for tier assignment.
+Os limiares são recomputados a cada retreinamento do modelo e armazenados em `stg_propensity_scores.sqlx` para segmentação de tier.
 
 ---
 
-## Project Structure
+## Estrutura do Projeto
 
 ```
 outbound-lead-scoring/
 │
 ├── models/
-│   └── propensity_model.py        # XGBoost pipeline, calibration, T-metric computation
+│   └── propensity_model.py        # Pipeline XGBoost, calibração, cálculo de métricas T
 │
 ├── features/
-│   ├── feature_engineering.py     # Python feature builders (RFM, behavioral, product, CRM)
-│   └── sql/                       # BigQuery SQL run before Python feature engineering
+│   ├── feature_engineering.py     # Construtores Python de features (RFM, comportamental, produto, CRM)
+│   └── sql/
 │
 ├── sql/features/
-│   └── behavioral_features.sql    # Rolling window behavioral aggregations (7d/30d/90d)
+│   └── behavioral_features.sql    # Agregações comportamentais em janelas deslizantes (7d/30d/90d)
 │
 ├── dataform/definitions/
 │   ├── staging/
-│   │   └── stg_propensity_scores.sqlx   # Validates Vertex AI output, assigns tiers
+│   │   └── stg_propensity_scores.sqlx   # Valida output do Vertex AI e atribui tiers
 │   └── marts/
-│       └── mart_lead_scoring.sqlx       # Final CRM-ready mart with dedup + argumentation
+│       └── mart_lead_scoring.sqlx       # Mart final pronto para CRM com dedup + argumentação
 │
 ├── data/
-│   └── generate_sample.py         # Generates synthetic dataset for local development
-│
-├── .github/workflows/
-│   ├── readme_generator.yml       # Auto-updates this README on every push (Claude API)
-│   └── pr_reviewer.yml            # Posts automated code review on every PR (Claude API)
+│   └── generate_sample.py         # Gera dataset sintético para desenvolvimento local
 │
 └── requirements.txt
 ```
 
 ---
 
-## Quickstart
+## Início Rápido
 
-### 1. Install dependencies
+### 1. Instalar dependências
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Generate synthetic data
+### 2. Gerar dados sintéticos
 
 ```bash
 python data/generate_sample.py
-# Creates: data/sample/leads.csv, events.csv, products.csv, crm.csv
+# Cria: data/sample/leads.csv, events.csv, products.csv, crm.csv
 ```
 
-### 3. Build features and train
+### 3. Construir features e treinar
 
 ```python
 import pandas as pd
 from features.feature_engineering import build_feature_matrix
 from models.propensity_model import PropensityModel, PropensityConfig
 
-# Load sample data
-df_leads   = pd.read_csv("data/sample/leads.csv")
-df_events  = pd.read_csv("data/sample/events.csv")
+# Carrega dados de exemplo
+df_leads    = pd.read_csv("data/sample/leads.csv")
+df_events   = pd.read_csv("data/sample/events.csv")
 df_products = pd.read_csv("data/sample/products.csv")
-df_crm     = pd.read_csv("data/sample/crm.csv")
+df_crm      = pd.read_csv("data/sample/crm.csv")
 
-# Build feature matrix
+# Constrói matriz de features
 df_features = build_feature_matrix(df_leads, df_events, df_products, df_crm)
 
-# Train model
-config = PropensityConfig(scale_pos_weight=24)  # neg/pos ratio
+# Treina o modelo
+config = PropensityConfig(scale_pos_weight=24)  # razão negativos/positivos
 model = PropensityModel(config=config)
 model.fit(df_features, label_col="converted")
 
-# Inspect T-metric thresholds
+# Inspeciona limiares T
 print(model.thresholds.summary())
 
-# Score and tier new leads
+# Pontua e segmenta novos leads
 scored = model.score_and_tier(df_features)
 print(scored.head())
 
-# Persist
+# Salva o modelo
 model.save("artifacts/model_v1")
 ```
 
-### 4. Evaluate on holdout
+### 4. Avaliar no holdout
 
 ```python
 metrics = model.evaluate(df_holdout, label_col="converted")
@@ -149,69 +145,51 @@ metrics = model.evaluate(df_holdout, label_col="converted")
 
 ---
 
-## Key Design Decisions
+## Decisões de Design
 
-### Probability calibration
-Raw XGBoost scores are well-ranked but miscalibrated — the model's output of 0.7 does not mean "70% chance of converting". Isotonic regression via `CalibratedClassifierCV` corrects this, enabling T-metric thresholds to be operationally meaningful (and stable across retrains).
+### Calibração de probabilidade
+Scores brutos do XGBoost são bem ordenados mas mal calibrados — um output de 0,7 não significa "70% de chance de converter". A regressão isotônica via `CalibratedClassifierCV` corrige isso, tornando os limiares T operacionalmente significativos e estáveis entre retreinamentos.
 
-### Deduplication
-The same customer may appear across multiple CRM pipelines (retention, cross-sell, cold outbound). `mart_lead_scoring.sqlx` deduplicates on CPF/CNPJ, keeping only the highest-scored occurrence. Without this, brokers would contact the same customer from different queues, degrading experience and inflating contact counts.
+### Deduplicação
+O mesmo cliente pode aparecer em múltiplos pipelines do CRM (retenção, cross-sell, outbound frio). O `mart_lead_scoring.sqlx` deduplica por CPF/CNPJ, mantendo apenas a ocorrência com maior score. Sem isso, corretores de filas diferentes contatariam o mesmo cliente, degradando a experiência e inflando contagens.
 
 ### `scale_pos_weight`
-With a 3–5% base rate, naive XGBoost ignores the minority class. `scale_pos_weight ≈ neg/pos ratio` (~20–30x) forces the model to weight false negatives more heavily, recovering recall on converters at the cost of some precision — the right tradeoff for outbound, where missed converters are expensive.
+Com taxa base de 3–5%, o XGBoost ingênuo ignora a classe minoritária. `scale_pos_weight ≈ razão neg/pos` (~20–30x) força o modelo a penalizar mais os falsos negativos — o tradeoff correto para outbound, onde conversores perdidos são caros.
 
-### Rolling windows (7d / 30d / 90d)
-Short windows (7d) capture recency signals — a lead who clicked an email yesterday is warm. Long windows (90d) capture frequency and historical engagement. Using all three windows simultaneously lets the model learn different temporal patterns without feature selection bias.
+### Janelas deslizantes (7d / 30d / 90d)
+Janelas curtas (7d) capturam sinais de recência — um lead que clicou em um e-mail ontem está quente. Janelas longas (90d) capturam frequência e engajamento histórico. Usar as três simultaneamente permite que o modelo aprenda padrões temporais distintos sem viés de seleção de features.
 
-### AUCPR over AUROC
-With heavy class imbalance, AUROC is optimistic (dominated by true negatives). Area Under the Precision-Recall Curve (AUCPR) is the correct metric — it directly measures performance on the minority class that matters.
+### AUCPR em vez de AUROC
+Com forte desbalanceamento de classes, o AUROC é otimista (dominado pelos verdadeiros negativos). A Área sob a Curva Precision-Recall (AUCPR) é a métrica correta — mede diretamente o desempenho na classe minoritária que importa.
 
 ---
 
-## BigQuery / Dataform Integration
+## Integração BigQuery / Dataform
 
-The Python model runs offline (local or Vertex AI). The BigQuery/Dataform layer handles:
+O modelo Python roda offline (local ou Vertex AI). A camada BigQuery/Dataform é responsável por:
 
-- **Feature computation at scale** — `behavioral_features.sql` processes millions of events daily using partition-pruned queries, avoiding full table scans
-- **Score validation** — `stg_propensity_scores.sqlx` rejects corrupt rows and enforces score bounds before they propagate downstream
-- **CRM enrichment** — `mart_lead_scoring.sqlx` is the single source of truth consumed by Power BI and CRM API sync; it abstracts away all upstream complexity
+- **Computação de features em escala** — `behavioral_features.sql` processa milhões de eventos diariamente com queries com pruning de partição, evitando full table scans
+- **Validação de scores** — `stg_propensity_scores.sqlx` rejeita linhas corrompidas e garante limites de score antes de propagar downstream
+- **Enriquecimento CRM** — `mart_lead_scoring.sqlx` é a fonte única da verdade consumida pelo Power BI e sincronização via API do CRM
 
-To deploy the Dataform pipeline:
+Para implantar o pipeline Dataform:
 ```bash
-dataform init bigquery --project-id YOUR_PROJECT --location us-east1
+dataform init bigquery --project-id SEU_PROJETO --location us-east1
 dataform run --tags lead_scoring
 ```
 
 ---
 
-## GitHub Actions Agents
+## Contribuindo
 
-This repo ships with two AI-powered automation workflows:
+1. Faça um fork do repositório
+2. Crie uma branch: `git checkout -b feat/sua-feature`
+3. Faça as alterações e abra um Pull Request contra `main`
 
-| Workflow | Trigger | What it does |
-|----------|---------|-------------|
-| `readme_generator.yml` | Push to `main` | Reads all `.py`/`.sql`/`.sqlx` files, calls Claude API, auto-updates this README |
-| `pr_reviewer.yml` | Pull request opened/updated | Diffs changed files, posts a structured code review comment (data leakage, NULL handling, partition pruning, etc.) |
-
-**Setup required:** Add `ANTHROPIC_API_KEY` in GitHub → Settings → Secrets → Actions.
+Estilo de código: `black` + `ruff`. SQL: palavras-chave em maiúsculo, indentação de 4 espaços, uma CTE por etapa lógica.
 
 ---
 
-## Contributing
+## Licença
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feat/your-feature`
-3. Make changes — the PR reviewer agent will automatically review your diff
-4. Open a pull request against `main`
-
-Code style: `black` + `ruff`. SQL style: uppercase keywords, 4-space indentation, one CTE per logical step.
-
----
-
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
-
----
-
-*README auto-generated by the `readme_generator` GitHub Actions agent using Claude.*
+MIT License. Veja [LICENSE](LICENSE) para detalhes.
